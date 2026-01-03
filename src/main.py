@@ -4,14 +4,24 @@ Kairos Control Plane - FastAPI Application
 Main API for managing Frappe SaaS tenant provisioning on GKE.
 """
 
+import contextvars
+import hashlib
+import hmac
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
+from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .models import (
     CreateTenantResponse,
@@ -22,28 +32,182 @@ from .models import (
     TenantResponse,
     TenantStatus,
     TenantStatusResponse,
+    TenantUpdate,
 )
 from .services import GKEService, TenantService
 
-# Configure logging
+
+# Structured JSON logging
+class JSONFormatter(logging.Formatter):
+    """Custom JSON formatter for structured logging."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        log_data = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
+        }
+
+        # Add request_id if available
+        try:
+            request_id = request_id_var.get()
+            if request_id:
+                log_data["request_id"] = request_id
+        except LookupError:
+            pass
+
+        # Add exception info if present
+        if record.exc_info:
+            log_data["exception"] = self.formatException(record.exc_info)
+
+        return json.dumps(log_data)
+
+
+# Configure logging with JSON formatter
+json_handler = logging.StreamHandler()
+json_handler.setFormatter(JSONFormatter())
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[json_handler],
 )
 logger = logging.getLogger(__name__)
 
+# Correlation ID context variable
+request_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "request_id", default=None
+)
+
 # Configuration from environment
+ENVIRONMENT = os.environ.get("ENVIRONMENT", "production")
+
+# CORS configuration
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://kairos.app",
+    "https://admin.kairos.app",
+    "https://landing.kairos.app",
+]
+
+# Add localhost for development
+if ENVIRONMENT == "development":
+    DEFAULT_ALLOWED_ORIGINS.append("http://localhost:3000")
+
 CONFIG = {
     "base_domain": os.environ.get("BASE_DOMAIN", "kairos.app"),
     "gke_namespace": os.environ.get("GKE_NAMESPACE", "frappe"),
     "frappe_image": os.environ.get("FRAPPE_IMAGE", "frappe/frappe-worker:v15"),
     "use_in_cluster": os.environ.get("USE_IN_CLUSTER", "true").lower() == "true",
-    "allowed_origins": os.environ.get("ALLOWED_ORIGINS", "*").split(","),
+    "allowed_origins": os.environ.get("ALLOWED_ORIGINS", ",".join(DEFAULT_ALLOWED_ORIGINS)).split(","),
 }
+
+# API Key configuration
+API_KEY = os.environ.get("API_KEY")
+API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+# Webhook secret for signature verification
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
+
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
 
 # Global services
 gke_service: Optional[GKEService] = None
 tenant_service: Optional[TenantService] = None
+
+
+# Security dependencies
+async def verify_api_key(api_key: Optional[str] = Security(API_KEY_HEADER)) -> str:
+    """
+    Verify the API key from the X-API-Key header.
+
+    Raises HTTPException 401 if the key is missing or invalid.
+    """
+    if not API_KEY:
+        # If no API_KEY is configured, skip authentication (development mode warning)
+        logger.warning("API_KEY not configured - authentication is disabled")
+        return "no-auth"
+
+    if not api_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    if not hmac.compare_digest(api_key, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "ApiKey"},
+        )
+
+    return api_key
+
+
+async def verify_webhook_signature(
+    request: Request,
+    x_webhook_signature: Optional[str] = Header(None, alias="X-Webhook-Signature"),
+) -> bool:
+    """
+    Verify webhook signature using HMAC-SHA256.
+
+    The signature should be computed as: HMAC-SHA256(WEBHOOK_SECRET, request_body)
+    """
+    if not WEBHOOK_SECRET:
+        logger.warning("WEBHOOK_SECRET not configured - webhook signature verification is disabled")
+        return True
+
+    if not x_webhook_signature:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing webhook signature",
+        )
+
+    # Get the raw body
+    body = await request.body()
+
+    # Compute expected signature
+    expected_signature = hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+    # Compare signatures using constant-time comparison
+    if not hmac.compare_digest(x_webhook_signature, expected_signature):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid webhook signature",
+        )
+
+    return True
+
+
+# Correlation ID middleware
+class CorrelationIDMiddleware(BaseHTTPMiddleware):
+    """Middleware to handle correlation IDs for request tracing."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Get or generate request ID
+        request_id = request.headers.get("X-Request-ID")
+        if not request_id:
+            import uuid
+            request_id = str(uuid.uuid4())
+
+        # Set in context var
+        request_id_var.set(request_id)
+
+        # Process request
+        response = await call_next(request)
+
+        # Add request ID to response headers
+        response.headers["X-Request-ID"] = request_id
+
+        return response
 
 
 @asynccontextmanager
@@ -87,13 +251,22 @@ app = FastAPI(
     redoc_url="/redoc",
 )
 
-# Add CORS middleware
+# Add rate limiter to app state
+app.state.limiter = limiter
+
+# Add rate limit exceeded exception handler
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add Correlation ID middleware
+app.add_middleware(CorrelationIDMiddleware)
+
+# Add CORS middleware with restricted settings
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CONFIG["allowed_origins"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
 )
 
 
@@ -115,7 +288,7 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
-# Health check endpoint
+# Health check endpoint (public - no auth required)
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """
@@ -141,7 +314,7 @@ async def root():
     }
 
 
-# Tenant endpoints
+# Tenant endpoints (protected with API key authentication)
 @app.post(
     "/tenants",
     response_model=CreateTenantResponse,
@@ -149,10 +322,14 @@ async def root():
     tags=["Tenants"],
     responses={
         400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
         409: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
     },
+    dependencies=[Depends(verify_api_key)],
 )
-async def create_tenant(data: TenantCreate):
+@limiter.limit("10/minute")
+async def create_tenant(request: Request, data: TenantCreate):
     """
     Create a new tenant.
 
@@ -162,6 +339,9 @@ async def create_tenant(data: TenantCreate):
     - **organization**: Name of the organization
     - **subdomain**: Unique subdomain for the tenant (alphanumeric only)
     - **email**: Admin email address
+
+    Requires X-API-Key header for authentication.
+    Rate limited to 10 requests per minute.
     """
     if not tenant_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
@@ -186,8 +366,15 @@ async def create_tenant(data: TenantCreate):
     "/tenants",
     response_model=TenantListResponse,
     tags=["Tenants"],
+    responses={
+        401: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
 )
+@limiter.limit("100/minute")
 async def list_tenants(
+    request: Request,
     skip: int = Query(0, ge=0, description="Number of records to skip"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum records to return"),
 ):
@@ -195,6 +382,9 @@ async def list_tenants(
     List all tenants with pagination.
 
     Returns a list of all tenants sorted by creation date (newest first).
+
+    Requires X-API-Key header for authentication.
+    Rate limited to 100 requests per minute.
     """
     if not tenant_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
@@ -224,18 +414,27 @@ async def list_tenants(
     "/tenants/{tenant_id}",
     response_model=TenantResponse,
     tags=["Tenants"],
-    responses={404: {"model": ErrorResponse}},
+    responses={
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
 )
-async def get_tenant(tenant_id: str):
+@limiter.limit("100/minute")
+async def get_tenant(request: Request, tenant_id: UUID):
     """
     Get a specific tenant by ID.
 
     Returns full tenant details including status and site URL.
+
+    Requires X-API-Key header for authentication.
+    Rate limited to 100 requests per minute.
     """
     if not tenant_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    tenant = await tenant_service.get_tenant(tenant_id)
+    tenant = await tenant_service.get_tenant(str(tenant_id))
 
     if not tenant:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -253,13 +452,76 @@ async def get_tenant(tenant_id: str):
     )
 
 
+@app.patch(
+    "/tenants/{tenant_id}",
+    response_model=TenantResponse,
+    tags=["Tenants"],
+    responses={
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+@limiter.limit("10/minute")
+async def update_tenant(request: Request, tenant_id: UUID, data: TenantUpdate):
+    """
+    Update a tenant's organization and/or email.
+
+    Only the provided fields will be updated.
+
+    - **organization**: New organization name (optional)
+    - **email**: New admin email address (optional)
+
+    Requires X-API-Key header for authentication.
+    Rate limited to 10 requests per minute.
+    """
+    if not tenant_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    # Get existing tenant
+    tenant = await tenant_service.get_tenant(str(tenant_id))
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    # Update only provided fields
+    update_data = data.model_dump(exclude_unset=True)
+
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    updated_tenant = await tenant_service.update_tenant(str(tenant_id), **update_data)
+
+    if not updated_tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    return TenantResponse(
+        id=updated_tenant["id"],
+        organization=updated_tenant["organization"],
+        subdomain=updated_tenant["subdomain"],
+        email=updated_tenant["email"],
+        status=updated_tenant["status"],
+        site_url=updated_tenant["site_url"],
+        error_message=updated_tenant["error_message"],
+        created_at=updated_tenant["created_at"],
+        updated_at=updated_tenant["updated_at"],
+    )
+
+
 @app.get(
     "/tenants/{tenant_id}/status",
     response_model=TenantStatusResponse,
     tags=["Tenants"],
-    responses={404: {"model": ErrorResponse}},
+    responses={
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
 )
-async def get_tenant_status(tenant_id: str):
+@limiter.limit("100/minute")
+async def get_tenant_status(request: Request, tenant_id: UUID):
     """
     Get the current status of a tenant.
 
@@ -271,11 +533,14 @@ async def get_tenant_status(tenant_id: str):
     - **failed**: Provisioning failed (check error_message)
     - **suspended**: Tenant is suspended
     - **deleting**: Tenant is being deleted
+
+    Requires X-API-Key header for authentication.
+    Rate limited to 100 requests per minute.
     """
     if not tenant_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    status = await tenant_service.get_tenant_status(tenant_id)
+    status = await tenant_service.get_tenant_status(str(tenant_id))
 
     if not status:
         raise HTTPException(status_code=404, detail="Tenant not found")
@@ -292,9 +557,15 @@ async def get_tenant_status(tenant_id: str):
 @app.delete(
     "/tenants/{tenant_id}",
     tags=["Tenants"],
-    responses={404: {"model": ErrorResponse}},
+    responses={
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
 )
-async def delete_tenant(tenant_id: str):
+@limiter.limit("5/minute")
+async def delete_tenant(request: Request, tenant_id: UUID):
     """
     Delete a tenant and all associated resources.
 
@@ -302,11 +573,14 @@ async def delete_tenant(tenant_id: str):
     - Remove the Frappe site from GKE
     - Delete associated Kubernetes resources
     - Remove the tenant record
+
+    Requires X-API-Key header for authentication.
+    Rate limited to 5 requests per minute.
     """
     if not tenant_service:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
-    result = await tenant_service.delete_tenant(tenant_id)
+    result = await tenant_service.delete_tenant(str(tenant_id))
 
     if not result["success"]:
         raise HTTPException(status_code=404, detail=result["error"])
@@ -314,13 +588,22 @@ async def delete_tenant(tenant_id: str):
     return {"success": True, "message": "Tenant deleted successfully"}
 
 
-# Webhook endpoint for GKE job status updates
-@app.post("/webhooks/job-status", tags=["Webhooks"])
+# Webhook endpoint for GKE job status updates (protected with signature verification)
+@app.post(
+    "/webhooks/job-status",
+    tags=["Webhooks"],
+    responses={
+        401: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_webhook_signature)],
+)
 async def job_status_webhook(request: Request):
     """
     Webhook endpoint for receiving job status updates from GKE.
 
     This is called by Kubernetes when provisioning jobs complete or fail.
+
+    Requires X-Webhook-Signature header with HMAC-SHA256 signature of the request body.
     """
     if not tenant_service:
         raise HTTPException(status_code=503, detail="Service not initialized")

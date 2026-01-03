@@ -33,6 +33,23 @@ class TenantCreate(BaseModel):
     subdomain: str = Field(..., min_length=3, max_length=30, description="Subdomain for the tenant")
     email: EmailStr = Field(..., description="Admin email address")
 
+    @field_validator("organization")
+    @classmethod
+    def validate_organization(cls, v: str) -> str:
+        """
+        Validate organization name format.
+        Only allows letters, numbers, spaces, hyphens, periods, and accented characters.
+        This prevents shell injection when used in GKE commands.
+        """
+        v = v.strip()
+        pattern = r'^[\w\s\-\.áéíóúñÁÉÍÓÚÑüÜ]+$'
+        if not re.match(pattern, v):
+            raise ValueError(
+                "Organization name can only contain letters, numbers, spaces, "
+                "hyphens, periods, and accented characters"
+            )
+        return v
+
     @field_validator("subdomain")
     @classmethod
     def validate_subdomain(cls, v: str) -> str:
@@ -48,6 +65,12 @@ class TenantCreate(BaseModel):
             raise ValueError(f"Subdomain '{subdomain}' is reserved and cannot be used")
 
         return subdomain
+
+
+class TenantUpdate(BaseModel):
+    """Request model for updating a tenant."""
+    organization: Optional[str] = Field(None, min_length=2, max_length=100)
+    email: Optional[EmailStr] = None
 
 
 class TenantResponse(BaseModel):
@@ -79,6 +102,9 @@ class TenantListResponse(BaseModel):
     """Response model for listing tenants."""
     tenants: list[TenantResponse]
     total: int
+    skip: int = 0
+    limit: int = 100
+    has_more: bool = False
 
 
 class CreateTenantResponse(BaseModel):
@@ -88,6 +114,21 @@ class CreateTenantResponse(BaseModel):
     subdomain: str
     status: TenantStatus
     message: str
+
+
+class JobStatusWebhook(BaseModel):
+    """Webhook payload for job status updates."""
+    tenant_id: str = Field(..., description="Tenant ID")
+    status: str = Field(..., description="New status value")
+    site_url: Optional[str] = Field(None, description="Site URL if active")
+    error_message: Optional[str] = Field(None, description="Error if failed")
+
+
+class APIInfo(BaseModel):
+    """API information response."""
+    name: str = "Kairos Control Plane"
+    version: str
+    docs: str = "/docs"
 
 
 class HealthResponse(BaseModel):

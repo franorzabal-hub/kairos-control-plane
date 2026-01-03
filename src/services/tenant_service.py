@@ -1,11 +1,44 @@
 """
 Tenant Service for managing tenant lifecycle.
+
+TODO: Replace _tenants_db in-memory storage with Firestore for production.
+The current in-memory dict is for demo/development purposes only.
+
+Future architecture should implement a TenantRepository interface:
+
+    class TenantRepository(ABC):
+        @abstractmethod
+        async def create(self, tenant: dict) -> dict: ...
+
+        @abstractmethod
+        async def get(self, tenant_id: str) -> Optional[dict]: ...
+
+        @abstractmethod
+        async def get_by_subdomain(self, subdomain: str) -> Optional[dict]: ...
+
+        @abstractmethod
+        async def update(self, tenant_id: str, updates: dict) -> Optional[dict]: ...
+
+        @abstractmethod
+        async def delete(self, tenant_id: str) -> bool: ...
+
+        @abstractmethod
+        async def list(self, skip: int, limit: int) -> tuple[list[dict], int]: ...
+
+    class FirestoreTenantRepository(TenantRepository):
+        # Production implementation using Firestore
+        pass
+
+    class InMemoryTenantRepository(TenantRepository):
+        # Development/testing implementation
+        pass
 """
 
+import asyncio
 import logging
 import secrets
 import string
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -15,8 +48,9 @@ from .gke_service import GKEService
 logger = logging.getLogger(__name__)
 
 
+# TODO: Replace with Firestore in production
 # In-memory storage for demo purposes
-# In production, use Cloud SQL or Firestore
+# In production, use Cloud SQL or Firestore via TenantRepository
 _tenants_db: dict[str, dict] = {}
 
 
@@ -30,6 +64,10 @@ class TenantService:
     - Coordination with GKE for provisioning
     """
 
+    # Class-level locks for subdomain race condition protection
+    _subdomain_locks: dict[str, asyncio.Lock] = {}
+    _global_lock: asyncio.Lock = asyncio.Lock()
+
     def __init__(self, gke_service: GKEService, base_domain: str = "kairos.app"):
         """
         Initialize the tenant service.
@@ -40,6 +78,21 @@ class TenantService:
         """
         self.gke = gke_service
         self.base_domain = base_domain
+
+    async def _acquire_subdomain_lock(self, subdomain: str) -> asyncio.Lock:
+        """
+        Acquire a lock for the given subdomain to prevent race conditions.
+
+        Args:
+            subdomain: The subdomain to lock
+
+        Returns:
+            The lock for the subdomain
+        """
+        async with self._global_lock:
+            if subdomain not in self._subdomain_locks:
+                self._subdomain_locks[subdomain] = asyncio.Lock()
+            return self._subdomain_locks[subdomain]
 
     def _generate_password(self, length: int = 16) -> str:
         """Generate a secure random password."""
@@ -56,37 +109,41 @@ class TenantService:
         Returns:
             dict with tenant info or error
         """
-        # Check if subdomain already exists
-        for tenant in _tenants_db.values():
-            if tenant["subdomain"] == data.subdomain:
-                return {
-                    "success": False,
-                    "error": f"Subdomain '{data.subdomain}' is already taken",
-                }
+        # Acquire subdomain lock to prevent race conditions
+        subdomain_lock = await self._acquire_subdomain_lock(data.subdomain)
 
-        # Generate unique ID and password
-        tenant_id = str(uuid4())
-        admin_password = self._generate_password()
-        now = datetime.utcnow()
+        async with subdomain_lock:
+            # Check if subdomain already exists (inside the lock)
+            for tenant in _tenants_db.values():
+                if tenant["subdomain"] == data.subdomain:
+                    return {
+                        "success": False,
+                        "error": f"Subdomain '{data.subdomain}' is already taken",
+                    }
 
-        # Create tenant record
-        tenant = {
-            "id": tenant_id,
-            "organization": data.organization,
-            "subdomain": data.subdomain,
-            "email": data.email,
-            "status": TenantStatus.QUEUED,
-            "site_url": None,
-            "error_message": None,
-            "created_at": now,
-            "updated_at": now,
-            "job_name": None,
-        }
+            # Generate unique ID and password
+            tenant_id = str(uuid4())
+            admin_password = self._generate_password()
+            now = datetime.now(timezone.utc)
 
-        _tenants_db[tenant_id] = tenant
-        logger.info(f"Created tenant record: {tenant_id} ({data.subdomain})")
+            # Create tenant record
+            tenant = {
+                "id": tenant_id,
+                "organization": data.organization,
+                "subdomain": data.subdomain,
+                "email": data.email,
+                "status": TenantStatus.QUEUED,
+                "site_url": None,
+                "error_message": None,
+                "created_at": now,
+                "updated_at": now,
+                "job_name": None,
+            }
 
-        # Create secret in Kubernetes
+            _tenants_db[tenant_id] = tenant
+            logger.info(f"Created tenant record: {tenant_id} ({data.subdomain})")
+
+        # Create secret in Kubernetes (outside subdomain lock to avoid blocking)
         if self.gke.is_connected:
             secret_result = await self.gke.create_tenant_secret(
                 tenant_id, admin_password
@@ -94,7 +151,7 @@ class TenantService:
             if not secret_result["success"]:
                 tenant["status"] = TenantStatus.FAILED
                 tenant["error_message"] = f"Failed to create credentials: {secret_result['error']}"
-                tenant["updated_at"] = datetime.utcnow()
+                tenant["updated_at"] = datetime.now(timezone.utc)
                 return {
                     "success": False,
                     "error": tenant["error_message"],
@@ -102,7 +159,7 @@ class TenantService:
 
             # Start provisioning job
             tenant["status"] = TenantStatus.PROVISIONING
-            tenant["updated_at"] = datetime.utcnow()
+            tenant["updated_at"] = datetime.now(timezone.utc)
 
             job_result = await self.gke.create_site_provisioning_job(
                 tenant_id=tenant_id,
@@ -117,7 +174,7 @@ class TenantService:
             else:
                 tenant["status"] = TenantStatus.FAILED
                 tenant["error_message"] = job_result["error"]
-                tenant["updated_at"] = datetime.utcnow()
+                tenant["updated_at"] = datetime.now(timezone.utc)
                 return {
                     "success": False,
                     "error": tenant["error_message"],
@@ -211,11 +268,11 @@ class TenantService:
                     tenant["status"] = TenantStatus.ACTIVE
                     site_name = f"{tenant['subdomain']}.{self.base_domain}"
                     tenant["site_url"] = f"https://{site_name}"
-                    tenant["updated_at"] = datetime.utcnow()
+                    tenant["updated_at"] = datetime.now(timezone.utc)
                 elif job_status["status"] == "failed":
                     tenant["status"] = TenantStatus.FAILED
                     tenant["error_message"] = "Provisioning job failed"
-                    tenant["updated_at"] = datetime.utcnow()
+                    tenant["updated_at"] = datetime.now(timezone.utc)
 
         return {
             "id": tenant["id"],
@@ -249,7 +306,7 @@ class TenantService:
             return False
 
         tenant["status"] = status
-        tenant["updated_at"] = datetime.utcnow()
+        tenant["updated_at"] = datetime.now(timezone.utc)
 
         if site_url:
             tenant["site_url"] = site_url
@@ -257,6 +314,39 @@ class TenantService:
             tenant["error_message"] = error_message
 
         return True
+
+    async def update_tenant(
+        self,
+        tenant_id: str,
+        organization: Optional[str] = None,
+        email: Optional[str] = None,
+    ) -> Optional[dict]:
+        """
+        Update tenant details.
+
+        Args:
+            tenant_id: Unique tenant identifier
+            organization: New organization name (optional)
+            email: New email address (optional)
+
+        Returns:
+            Updated tenant data or None if not found
+        """
+        tenant = _tenants_db.get(tenant_id)
+        if not tenant:
+            return None
+
+        # Update only provided fields
+        if organization is not None:
+            tenant["organization"] = organization
+        if email is not None:
+            tenant["email"] = email
+
+        # Always update the timestamp when any field is modified
+        tenant["updated_at"] = datetime.now(timezone.utc)
+
+        logger.info(f"Updated tenant: {tenant_id}")
+        return tenant
 
     async def delete_tenant(self, tenant_id: str) -> dict:
         """
@@ -266,7 +356,7 @@ class TenantService:
             tenant_id: Unique tenant identifier
 
         Returns:
-            dict with success status
+            dict with success status and details about what was deleted
         """
         tenant = _tenants_db.get(tenant_id)
         if not tenant:
@@ -274,7 +364,7 @@ class TenantService:
 
         # Mark as deleting
         tenant["status"] = TenantStatus.DELETING
-        tenant["updated_at"] = datetime.utcnow()
+        tenant["updated_at"] = datetime.now(timezone.utc)
 
         # Delete GKE resources
         if self.gke.is_connected:
@@ -282,10 +372,33 @@ class TenantService:
                 tenant_id, tenant["subdomain"]
             )
             if not result["success"]:
-                logger.warning(f"Failed to delete some GKE resources: {result}")
+                # GKE deletion failed - do NOT delete the tenant record
+                # Set status to FAILED with error message
+                tenant["status"] = TenantStatus.FAILED
+                error_msg = f"Failed to delete GKE resources: {result.get('error', 'Unknown error')}"
+                tenant["error_message"] = error_msg
+                tenant["updated_at"] = datetime.now(timezone.utc)
+                logger.error(f"Failed to delete GKE resources for tenant {tenant_id}: {result}")
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "details": {
+                        "tenant_id": tenant_id,
+                        "subdomain": tenant["subdomain"],
+                        "gke_error": result.get("error"),
+                        "resources_remaining": result.get("resources_remaining", []),
+                    },
+                }
 
-        # Remove from database
+        # Only delete from database if ALL GKE resources were deleted successfully
         del _tenants_db[tenant_id]
         logger.info(f"Deleted tenant: {tenant_id}")
 
-        return {"success": True}
+        return {
+            "success": True,
+            "details": {
+                "tenant_id": tenant_id,
+                "subdomain": tenant["subdomain"],
+                "message": "Tenant and all associated resources deleted successfully",
+            },
+        }
