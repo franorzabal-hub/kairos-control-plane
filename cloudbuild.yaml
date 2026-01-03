@@ -1,72 +1,63 @@
-# Cloud Build configuration for Kairos Control Plane
-# Builds and deploys to Cloud Run
+# Kairos Control Plane - Cloud Build Pipeline
+# Trigger: push to main branch in kairos-control-plane repo
+# Deploys FastAPI service to Cloud Run
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
 
 substitutions:
   _SERVICE_NAME: kairos-control-plane
   _REGION: us-central1
-  _GKE_NAMESPACE: frappe
-  _BASE_DOMAIN: kairos.app
   _GKE_CLUSTER: kairos-cluster-dev
-  _GKE_LOCATION: us-central1
+  _GKE_REGION: us-central1
 
 steps:
-  # Build the Docker image
+  # Build Docker image
   - name: 'gcr.io/cloud-builders/docker'
+    id: 'build'
     args:
       - 'build'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/kairos/control-plane:$SHORT_SHA'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:latest'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/kairos/control-plane:latest'
+      - '-f'
+      - 'Dockerfile'
       - '.'
 
-  # Push the Docker image to Container Registry
+  # Push image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
+    id: 'push'
     args:
       - 'push'
-      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
-
-  - name: 'gcr.io/cloud-builders/docker'
-    args:
-      - 'push'
-      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:latest'
+      - '--all-tags'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/kairos/control-plane'
+    waitFor: ['build']
 
   # Deploy to Cloud Run
-  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-    entrypoint: gcloud
+  - name: 'gcr.io/cloud-builders/gcloud'
+    id: 'deploy'
     args:
       - 'run'
       - 'deploy'
       - '${_SERVICE_NAME}'
       - '--image'
-      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
+      - 'us-central1-docker.pkg.dev/$PROJECT_ID/kairos/control-plane:$SHORT_SHA'
       - '--region'
       - '${_REGION}'
       - '--platform'
       - 'managed'
-      - '--allow-unauthenticated'
+      - '--port'
+      - '8000'
       - '--set-env-vars'
-      - 'BASE_DOMAIN=${_BASE_DOMAIN},GKE_NAMESPACE=${_GKE_NAMESPACE},USE_IN_CLUSTER=false,GKE_PROJECT=$PROJECT_ID,GKE_CLUSTER=${_GKE_CLUSTER},GKE_LOCATION=${_GKE_LOCATION}'
-      - '--set-secrets'
-      - 'API_KEY=kairos-api-key:latest,WEBHOOK_SECRET=kairos-webhook-secret:latest'
-      - '--service-account'
-      - 'kairos-control-plane@$PROJECT_ID.iam.gserviceaccount.com'
-      - '--min-instances'
-      - '0'
-      - '--max-instances'
-      - '10'
-      - '--memory'
-      - '512Mi'
-      - '--cpu'
-      - '1'
-      - '--timeout'
-      - '300'
-      - '--concurrency'
-      - '80'
+      - 'GKE_CLUSTER=${_GKE_CLUSTER},GKE_REGION=${_GKE_REGION}'
+      - '--no-allow-unauthenticated'
+    waitFor: ['push']
 
 images:
-  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$COMMIT_SHA'
-  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:latest'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/kairos/control-plane:$SHORT_SHA'
+  - 'us-central1-docker.pkg.dev/$PROJECT_ID/kairos/control-plane:latest'
 
-options:
-  logging: CLOUD_LOGGING_ONLY
+timeout: '900s'
+tags: ['control-plane', 'cloud-run', 'deploy']
