@@ -45,6 +45,8 @@ steps:
       - '--allow-unauthenticated'
       - '--set-env-vars'
       - 'BASE_DOMAIN=${_BASE_DOMAIN},GKE_NAMESPACE=${_GKE_NAMESPACE},USE_IN_CLUSTER=false'
+      - '--set-secrets'
+      - 'API_KEY=kairos-api-key:latest,WEBHOOK_SECRET=kairos-webhook-secret:latest'
       - '--min-instances'
       - '0'
       - '--max-instances'
