@@ -12,29 +12,49 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
+from urllib.parse import urlencode
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.security import APIKeyHeader
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from pydantic import EmailStr, ValidationError, validate_email
+
 from .models import (
     CreateTenantResponse,
     ErrorResponse,
     HealthResponse,
+    RESERVED_SUBDOMAINS,
+    SignupRequest,
+    SignupResponse,
+    SubdomainChangeRequest,
+    SubdomainChangeResponse,
     TenantCreate,
+    TenantInfo,
     TenantListResponse,
     TenantResponse,
     TenantStatus,
     TenantStatusResponse,
     TenantUpdate,
+    TrialSignupRequest,
+    TrialSignupResponse,
+    UserLookupResponse,
+    ValidateSignupResponse,
+    generate_auto_subdomain,
 )
-from .services import GKEService, TenantService
+from .services import GKEService, TenantService, DemoService, PendingSignupsService, EmailService
+
+# Demo tenant configuration
+DEMO_TENANT_URL = os.environ.get("DEMO_TENANT_URL", "https://demo.kairos.app")
+
+# Landing page URL for redirects
+LANDING_PAGE_URL = os.environ.get("LANDING_PAGE_URL", "https://kairos.app")
 
 
 # Structured JSON logging
@@ -94,7 +114,11 @@ DEFAULT_ALLOWED_ORIGINS = [
 
 # Add localhost for development
 if ENVIRONMENT == "development":
-    DEFAULT_ALLOWED_ORIGINS.append("http://localhost:3000")
+    DEFAULT_ALLOWED_ORIGINS.extend([
+        "http://localhost:3000",
+        "http://localhost:4321",  # Astro landing page
+        "http://localhost:8080",
+    ])
 
 CONFIG = {
     "base_domain": os.environ.get("BASE_DOMAIN", "kairos.app"),
@@ -117,6 +141,9 @@ limiter = Limiter(key_func=get_remote_address)
 # Global services
 gke_service: Optional[GKEService] = None
 tenant_service: Optional[TenantService] = None
+demo_service: Optional[DemoService] = None
+pending_signups_service: Optional[PendingSignupsService] = None
+email_service: Optional[EmailService] = None
 
 
 # Security dependencies
@@ -215,7 +242,7 @@ async def lifespan(app: FastAPI):
     """
     Application lifespan handler for startup/shutdown.
     """
-    global gke_service, tenant_service
+    global gke_service, tenant_service, demo_service, pending_signups_service, email_service
 
     # Startup
     logger.info("Starting Kairos Control Plane...")
@@ -233,7 +260,27 @@ async def lifespan(app: FastAPI):
         base_domain=CONFIG["base_domain"],
     )
 
+    # Initialize demo service for trial signups
+    demo_service = DemoService(demo_tenant_url=DEMO_TENANT_URL)
+
+    # Initialize pending signups service
+    pending_signups_service = PendingSignupsService()
+
+    # Initialize email service
+    email_service = EmailService(base_url=f"https://{CONFIG['base_domain']}")
+
     logger.info(f"Control Plane initialized - GKE connected: {gke_service.is_connected}")
+
+    # TODO: Add a scheduled task to clean up expired pending signups periodically.
+    # This could be done using:
+    # - APScheduler: https://apscheduler.readthedocs.io/
+    # - Cloud Scheduler (GCP) to call a cleanup endpoint
+    # - A background asyncio task that runs every hour
+    # Example:
+    #   async def cleanup_task():
+    #       while True:
+    #           await asyncio.sleep(3600)  # Run every hour
+    #           await pending_signups_service.cleanup_expired()
 
     yield
 
@@ -261,12 +308,14 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CorrelationIDMiddleware)
 
 # Add CORS middleware with restricted settings
+# In development, allow all origins for easier testing
+cors_origins = ["*"] if ENVIRONMENT == "development" else CONFIG["allowed_origins"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CONFIG["allowed_origins"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
+    allow_origins=cors_origins,
+    allow_credentials=False if ENVIRONMENT == "development" else True,  # credentials can't be used with "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -314,6 +363,309 @@ async def root():
     }
 
 
+# User lookup endpoint (public - no auth required)
+@app.get(
+    "/api/user/lookup",
+    response_model=UserLookupResponse,
+    tags=["Users"],
+    responses={
+        400: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+@limiter.limit("20/minute")
+async def user_lookup(
+    request: Request,
+    email: str = Query(..., description="Email address to look up"),
+):
+    """
+    Look up tenants associated with an email address.
+
+    This is a public endpoint (no authentication required) that allows users
+    to find which tenants they belong to based on their email address.
+
+    - **email**: Email address to search for
+
+    Returns a list of tenants associated with the email.
+    Rate limited to 20 requests per minute.
+    """
+    if not tenant_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    # Validate email format
+    try:
+        validate_email(email)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid email format")
+
+    # Search for tenants by email
+    tenants = await tenant_service.get_tenants_by_email(email)
+
+    # Build response with tenant info
+    tenant_infos = []
+    for tenant in tenants:
+        # Build the URL - use site_url if available, otherwise construct from subdomain
+        url = tenant.get("site_url")
+        if not url:
+            url = f"https://{tenant['subdomain']}.{CONFIG['base_domain']}"
+
+        tenant_infos.append(
+            TenantInfo(
+                name=tenant["organization"],
+                slug=tenant["subdomain"],
+                url=url,
+            )
+        )
+
+    return UserLookupResponse(tenants=tenant_infos)
+
+
+# Trial signup endpoint (public - no auth required)
+@app.post(
+    "/api/signup/trial",
+    response_model=TrialSignupResponse,
+    status_code=201,
+    tags=["Users"],
+    responses={
+        400: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+@limiter.limit("10/minute")
+async def trial_signup(request: Request, data: TrialSignupRequest):
+    """
+    Sign up for a trial account in the demo tenant.
+
+    This endpoint creates a new user in the shared demo tenant (demo.kairos.app)
+    instead of provisioning a new tenant. All trial users share the same demo
+    environment.
+
+    Authentication can be via:
+    - **password**: Local password authentication (min 8 characters)
+    - **google_token**: Google OAuth token for SSO authentication
+
+    Exactly one of password or google_token must be provided.
+
+    Returns the demo tenant URL and a session token for immediate login.
+    Rate limited to 10 requests per minute.
+    """
+    if not demo_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    # Check if user already exists
+    user_exists = await demo_service.check_user_exists(data.email)
+    if user_exists:
+        raise HTTPException(
+            status_code=409,
+            detail="A user with this email already exists. Please login instead."
+        )
+
+    # Create trial user in demo tenant
+    result = await demo_service.create_trial_user(data)
+
+    if not result["success"]:
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed to create trial user"))
+
+    return TrialSignupResponse(
+        tenant_url=result["tenant_url"],
+        token=result["token"],
+        message=result["message"],
+        user_id=result["user_id"],
+    )
+
+
+# New signup flow endpoints (public - no auth required)
+@app.post(
+    "/api/tenants/signup",
+    response_model=SignupResponse,
+    status_code=201,
+    tags=["Signup"],
+    responses={
+        400: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+@limiter.limit("10/minute")
+async def tenant_signup(request: Request, data: SignupRequest):
+    """
+    Sign up to create a new tenant.
+
+    This endpoint supports two authentication methods:
+
+    1. **Google OAuth** (google_token provided):
+       - Validates the Google token
+       - Creates tenant immediately with auto-generated subdomain (org-{uuid[:8]})
+       - Returns tenant_url for immediate access
+
+    2. **Email/Password** (email + password provided):
+       - Creates a pending signup
+       - Returns pending=True with instructions to validate email
+       - Tenant is created after email validation via /api/tenants/validate/{token}
+
+    Rate limited to 10 requests per minute.
+    """
+    if not tenant_service or not pending_signups_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    # Handle Google OAuth signup (immediate tenant creation)
+    if data.google_token:
+        # TODO: Validate Google token and extract email
+        # For now, we'll use a placeholder email from the token validation
+        if demo_service:
+            google_info = await demo_service.verify_google_token(data.google_token)
+            if not google_info:
+                raise HTTPException(status_code=400, detail="Invalid Google token")
+            email = google_info.get("email", "user@example.com")
+        else:
+            email = "user@example.com"
+
+        # Create tenant with auto-generated subdomain
+        tenant_data = TenantCreate(
+            school_name=data.school_name,
+            email=email,
+            is_trial=True,
+        )
+
+        result = await tenant_service.create_tenant(tenant_data)
+
+        if not result["success"]:
+            if "already taken" in result.get("error", ""):
+                raise HTTPException(status_code=409, detail=result["error"])
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to create tenant"))
+
+        tenant_url = f"https://{result['subdomain']}.{CONFIG['base_domain']}"
+
+        return SignupResponse(
+            pending=False,
+            message="Tenant created successfully. You can now access your site.",
+            tenant_url=tenant_url,
+            tenant_id=result["id"],
+        )
+
+    # Handle email/password signup (pending validation)
+    if data.email and data.password:
+        # Check if email already has an active tenant
+        existing_tenants = await tenant_service.get_tenants_by_email(data.email)
+        if existing_tenants:
+            raise HTTPException(
+                status_code=409,
+                detail="A tenant with this email already exists. Please login instead."
+            )
+
+        # Create pending signup
+        result = await pending_signups_service.create_pending_signup(
+            school_name=data.school_name,
+            email=data.email,
+            password=data.password,
+        )
+
+        if not result["success"]:
+            raise HTTPException(status_code=400, detail=result.get("error", "Failed to create signup"))
+
+        # Send validation email
+        if email_service:
+            email_result = await email_service.send_validation_email(
+                to_email=data.email,
+                validation_token=result["validation_token"],
+                school_name=data.school_name,
+            )
+            if not email_result["success"]:
+                logger.warning(f"Failed to send validation email: {email_result.get('error')}")
+        else:
+            logger.info(f"Pending signup created. Validation token: {result['validation_token']}")
+
+        return SignupResponse(
+            pending=True,
+            message="Please check your email to validate your account. The validation link will expire in 48 hours.",
+        )
+
+    # Should not reach here due to model validation, but just in case
+    raise HTTPException(
+        status_code=400,
+        detail="Either google_token or email+password must be provided"
+    )
+
+
+@app.get(
+    "/api/tenants/validate/{token}",
+    tags=["Signup"],
+    responses={
+        302: {"description": "Redirect to tenant URL on success or landing page with error on failure"},
+        429: {"model": ErrorResponse},
+    },
+)
+@limiter.limit("20/minute")
+async def validate_signup(request: Request, token: str):
+    """
+    Validate a pending signup and create the tenant.
+
+    This endpoint is called when a user clicks the validation link in their email.
+
+    - **token**: The validation token from the email
+
+    On success:
+    - Creates the tenant with auto-generated subdomain (org-{uuid[:8]})
+    - Deletes the pending signup
+    - Redirects (302) to the tenant URL
+
+    On failure (token invalid/expired or tenant creation failed):
+    - Redirects (302) to the landing page with error message in query param
+
+    Rate limited to 20 requests per minute.
+    """
+    if not tenant_service or not pending_signups_service:
+        error_params = urlencode({"error": "Service temporarily unavailable. Please try again later."})
+        return RedirectResponse(
+            url=f"{LANDING_PAGE_URL}/signup?{error_params}",
+            status_code=302,
+        )
+
+    # Find pending signup by token
+    pending_signup = await pending_signups_service.get_by_token(token)
+
+    if not pending_signup:
+        error_params = urlencode({"error": "Invalid or expired validation token. Please sign up again."})
+        return RedirectResponse(
+            url=f"{LANDING_PAGE_URL}/signup?{error_params}",
+            status_code=302,
+        )
+
+    # Create tenant with auto-generated subdomain
+    tenant_data = TenantCreate(
+        school_name=pending_signup["school_name"],
+        email=pending_signup["email"],
+        is_trial=True,
+    )
+
+    result = await tenant_service.create_tenant(tenant_data)
+
+    if not result["success"]:
+        error_message = result.get("error", "Failed to create tenant")
+        if "already taken" in error_message:
+            # Clean up the pending signup since tenant exists
+            await pending_signups_service.delete_by_id(pending_signup["id"])
+        error_params = urlencode({"error": error_message})
+        return RedirectResponse(
+            url=f"{LANDING_PAGE_URL}/signup?{error_params}",
+            status_code=302,
+        )
+
+    # Delete pending signup
+    await pending_signups_service.delete_by_id(pending_signup["id"])
+
+    tenant_url = f"https://{result['subdomain']}.{CONFIG['base_domain']}"
+
+    logger.info(f"Tenant validated and created: {result['id']} ({result['subdomain']})")
+
+    # Redirect to the newly created tenant
+    return RedirectResponse(url=tenant_url, status_code=302)
+
+
 # Tenant endpoints (protected with API key authentication)
 @app.post(
     "/tenants",
@@ -336,9 +688,19 @@ async def create_tenant(request: Request, data: TenantCreate):
     This endpoint starts the tenant provisioning process asynchronously.
     Poll GET /tenants/{id}/status to check provisioning progress.
 
-    - **organization**: Name of the organization
-    - **subdomain**: Unique subdomain for the tenant (alphanumeric only)
-    - **email**: Admin email address
+    Supports two formats (backwards compatible):
+
+    1. Original format:
+       - **organization**: Name of the organization
+       - **subdomain**: Unique subdomain for the tenant (alphanumeric only)
+       - **email**: Admin email address
+
+    2. New signup format:
+       - **school_name**: Name of the school (used as organization)
+       - **first_name**: Admin first name
+       - **last_name**: Admin last name
+       - **email**: Admin email address
+       - subdomain is auto-generated from school_name
 
     Requires X-API-Key header for authentication.
     Rate limited to 10 requests per minute.
@@ -353,12 +715,17 @@ async def create_tenant(request: Request, data: TenantCreate):
             raise HTTPException(status_code=409, detail=result["error"])
         raise HTTPException(status_code=400, detail=result["error"])
 
+    # Build tenant URL
+    tenant_url = f"https://{result['subdomain']}.{CONFIG['base_domain']}"
+
     return CreateTenantResponse(
         success=True,
         id=result["id"],
         subdomain=result["subdomain"],
         status=result["status"],
         message=result["message"],
+        site_url=result.get("site_url"),
+        tenant_url=tenant_url,
     )
 
 
@@ -635,6 +1002,92 @@ async def job_status_webhook(request: Request):
         raise HTTPException(status_code=404, detail="Tenant not found")
 
     return {"success": True, "message": "Status updated"}
+
+
+@app.put(
+    "/api/tenants/{tenant_id}/subdomain",
+    response_model=SubdomainChangeResponse,
+    tags=["Tenants"],
+    responses={
+        400: {"model": ErrorResponse},
+        401: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+    },
+    dependencies=[Depends(verify_api_key)],
+)
+@limiter.limit("5/minute")
+async def change_subdomain(
+    request: Request,
+    tenant_id: UUID,
+    data: SubdomainChangeRequest,
+):
+    """
+    Change a tenant's subdomain.
+
+    This endpoint allows changing the subdomain for an existing tenant.
+
+    Validation rules:
+    - Only alphanumeric characters and hyphens allowed
+    - Must start and end with alphanumeric character
+    - 3-30 characters
+    - Cannot be a reserved subdomain (www, api, app, admin, etc.)
+    - Cannot be already in use by another tenant
+
+    Requires X-API-Key header for authentication.
+    Rate limited to 5 requests per minute.
+    """
+    if not tenant_service:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    # Get existing tenant
+    tenant = await tenant_service.get_tenant(str(tenant_id))
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    new_subdomain = data.new_subdomain
+
+    # Check if subdomain is the same as current
+    if new_subdomain == tenant["subdomain"]:
+        raise HTTPException(
+            status_code=400,
+            detail="New subdomain is the same as the current subdomain"
+        )
+
+    # Check if subdomain is already taken by another tenant
+    existing_tenant = await tenant_service.get_tenant_by_subdomain(new_subdomain)
+    if existing_tenant and existing_tenant["id"] != str(tenant_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Subdomain '{new_subdomain}' is already in use"
+        )
+
+    # Store old URL for response
+    old_url = f"https://{tenant['subdomain']}.{CONFIG['base_domain']}"
+
+    # Update the tenant's subdomain
+    updated_tenant = await tenant_service.update_tenant_subdomain(
+        str(tenant_id),
+        new_subdomain
+    )
+
+    if not updated_tenant:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update subdomain"
+        )
+
+    # Build new URL
+    new_url = f"https://{new_subdomain}.{CONFIG['base_domain']}"
+
+    return SubdomainChangeResponse(
+        success=True,
+        old_url=old_url,
+        new_url=new_url,
+        message=f"Subdomain successfully changed from '{tenant['subdomain']}' to '{new_subdomain}'"
+    )
 
 
 if __name__ == "__main__":

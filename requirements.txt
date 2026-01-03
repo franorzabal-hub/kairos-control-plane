@@ -23,6 +23,7 @@ google-cloud-firestore==2.14.0
 
 # Security
 python-jose[cryptography]==3.3.0
+bcrypt>=4.0.0
 
 # Testing
 pytest==8.0.0

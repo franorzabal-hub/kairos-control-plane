@@ -77,3 +77,4 @@ venv.bak/
 # Local configuration
 .env.local
 .env.*.local
+.beads

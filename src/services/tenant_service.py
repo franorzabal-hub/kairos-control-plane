@@ -219,6 +219,23 @@ class TenantService:
                 return tenant
         return None
 
+    async def get_tenants_by_email(self, email: str) -> list[dict]:
+        """
+        Get all tenants associated with an email address.
+
+        Args:
+            email: Email address to search for
+
+        Returns:
+            List of tenant data dictionaries (may be empty)
+        """
+        email_lower = email.lower()
+        matching_tenants = []
+        for tenant in _tenants_db.values():
+            if tenant["email"].lower() == email_lower:
+                matching_tenants.append(tenant)
+        return matching_tenants
+
     async def list_tenants(
         self, skip: int = 0, limit: int = 100
     ) -> tuple[list[dict], int]:
@@ -346,6 +363,52 @@ class TenantService:
         tenant["updated_at"] = datetime.now(timezone.utc)
 
         logger.info(f"Updated tenant: {tenant_id}")
+        return tenant
+
+    async def update_tenant_subdomain(
+        self,
+        tenant_id: str,
+        new_subdomain: str,
+    ) -> Optional[dict]:
+        """
+        Update a tenant's subdomain.
+
+        Args:
+            tenant_id: Unique tenant identifier
+            new_subdomain: New subdomain for the tenant
+
+        Returns:
+            Updated tenant data or None if not found
+        """
+        tenant = _tenants_db.get(tenant_id)
+        if not tenant:
+            return None
+
+        old_subdomain = tenant["subdomain"]
+
+        # Acquire lock for the new subdomain to prevent race conditions
+        subdomain_lock = await self._acquire_subdomain_lock(new_subdomain)
+
+        async with subdomain_lock:
+            # Double-check the subdomain is not taken (inside the lock)
+            for t in _tenants_db.values():
+                if t["subdomain"] == new_subdomain and t["id"] != tenant_id:
+                    logger.warning(
+                        f"Subdomain '{new_subdomain}' already taken during update for tenant {tenant_id}"
+                    )
+                    return None
+
+            # Update the subdomain
+            tenant["subdomain"] = new_subdomain
+            tenant["updated_at"] = datetime.now(timezone.utc)
+
+            # Update site_url if it was set
+            if tenant.get("site_url"):
+                tenant["site_url"] = f"https://{new_subdomain}.{self.base_domain}"
+
+        logger.info(
+            f"Updated subdomain for tenant {tenant_id}: '{old_subdomain}' -> '{new_subdomain}'"
+        )
         return tenant
 
     async def delete_tenant(self, tenant_id: str) -> dict:
