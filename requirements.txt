@@ -8,6 +8,10 @@ pydantic[email]==2.5.3
 # Kubernetes client
 kubernetes==29.0.0
 
+# Google Cloud authentication (for GKE from Cloud Run)
+google-auth==2.27.0
+google-cloud-container==2.38.0
+
 # HTTP client
 httpx==0.26.0
 

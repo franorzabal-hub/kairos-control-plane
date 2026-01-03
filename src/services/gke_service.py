@@ -3,15 +3,26 @@ GKE Service for managing Frappe site provisioning in Kubernetes.
 """
 
 import asyncio
+import base64
 import functools
 import logging
+import os
 import shlex
+import tempfile
 from typing import Optional, Callable, TypeVar, Any
 
+import google.auth
+import google.auth.transport.requests
+from google.cloud import container_v1
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
 logger = logging.getLogger(__name__)
+
+# GKE cluster configuration from environment
+GKE_PROJECT = os.environ.get("GKE_PROJECT", "kairos-escuela-app")
+GKE_LOCATION = os.environ.get("GKE_LOCATION", "us-central1")
+GKE_CLUSTER = os.environ.get("GKE_CLUSTER", "kairos-cluster-dev")
 
 T = TypeVar("T")
 
@@ -110,7 +121,7 @@ class GKEService:
         Args:
             namespace: Kubernetes namespace for Frappe workloads
             frappe_image: Docker image for Frappe worker
-            use_in_cluster: Whether running inside a cluster (True for Cloud Run)
+            use_in_cluster: Whether running inside a cluster (True for in-cluster, False for Cloud Run/external)
         """
         self.namespace = namespace
         self.frappe_image = frappe_image
@@ -118,8 +129,11 @@ class GKEService:
         try:
             if use_in_cluster:
                 config.load_incluster_config()
+                logger.info("Loaded in-cluster Kubernetes config")
             else:
-                config.load_kube_config()
+                # Try to connect to GKE from outside the cluster (Cloud Run)
+                self._configure_gke_client()
+                logger.info("Connected to GKE cluster from Cloud Run")
 
             self.core_v1 = client.CoreV1Api()
             self.batch_v1 = client.BatchV1Api()
@@ -128,6 +142,46 @@ class GKEService:
         except Exception as e:
             logger.warning(f"Could not connect to Kubernetes cluster: {e}")
             self._connected = False
+
+    def _configure_gke_client(self):
+        """
+        Configure Kubernetes client to connect to GKE from Cloud Run.
+
+        Uses Application Default Credentials (ADC) which automatically
+        uses the Cloud Run service account.
+        """
+        # Get credentials using ADC (Application Default Credentials)
+        credentials, project = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        )
+
+        # Refresh credentials to get access token
+        auth_req = google.auth.transport.requests.Request()
+        credentials.refresh(auth_req)
+
+        # Get cluster info from GKE API
+        cluster_manager = container_v1.ClusterManagerClient(credentials=credentials)
+        cluster_name = f"projects/{GKE_PROJECT}/locations/{GKE_LOCATION}/clusters/{GKE_CLUSTER}"
+
+        cluster = cluster_manager.get_cluster(name=cluster_name)
+
+        # Configure kubernetes client
+        configuration = client.Configuration()
+        configuration.host = f"https://{cluster.endpoint}"
+
+        # Use the access token for authentication
+        configuration.api_key = {"authorization": f"Bearer {credentials.token}"}
+
+        # Set up CA certificate
+        ca_cert = base64.b64decode(cluster.master_auth.cluster_ca_certificate)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".crt") as ca_file:
+            ca_file.write(ca_cert)
+            configuration.ssl_ca_cert = ca_file.name
+
+        # Set this as the default configuration
+        client.Configuration.set_default(configuration)
+
+        logger.info(f"Configured GKE client for cluster: {GKE_CLUSTER}")
 
     @property
     def is_connected(self) -> bool:

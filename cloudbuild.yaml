@@ -6,6 +6,8 @@ substitutions:
   _REGION: us-central1
   _GKE_NAMESPACE: frappe
   _BASE_DOMAIN: kairos.app
+  _GKE_CLUSTER: kairos-cluster-dev
+  _GKE_LOCATION: us-central1
 
 steps:
   # Build the Docker image
@@ -44,9 +46,11 @@ steps:
       - 'managed'
       - '--allow-unauthenticated'
       - '--set-env-vars'
-      - 'BASE_DOMAIN=${_BASE_DOMAIN},GKE_NAMESPACE=${_GKE_NAMESPACE},USE_IN_CLUSTER=false'
+      - 'BASE_DOMAIN=${_BASE_DOMAIN},GKE_NAMESPACE=${_GKE_NAMESPACE},USE_IN_CLUSTER=false,GKE_PROJECT=$PROJECT_ID,GKE_CLUSTER=${_GKE_CLUSTER},GKE_LOCATION=${_GKE_LOCATION}'
       - '--set-secrets'
       - 'API_KEY=kairos-api-key:latest,WEBHOOK_SECRET=kairos-webhook-secret:latest'
+      - '--service-account'
+      - 'kairos-control-plane@$PROJECT_ID.iam.gserviceaccount.com'
       - '--min-instances'
       - '0'
       - '--max-instances'
