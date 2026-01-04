@@ -18,8 +18,11 @@ httpx==0.26.0
 # Rate limiting
 slowapi==0.1.9
 
-# Firestore (for future persistence)
+# Firestore (for tenant persistence)
 google-cloud-firestore==2.14.0
+
+# Secret Manager (for credential storage)
+google-cloud-secret-manager==2.18.0
 
 # Security
 python-jose[cryptography]==3.3.0

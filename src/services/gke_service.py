@@ -494,6 +494,162 @@ class GKEService:
                 "details": error_body,
             }
 
+    async def create_tenant_namespace(self, tenant_id: str, subdomain: str) -> dict:
+        """
+        Create a dedicated namespace for a tenant.
+
+        Args:
+            tenant_id: Unique tenant identifier
+            subdomain: Tenant subdomain
+
+        Returns:
+            dict with success status and namespace name
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to Kubernetes"}
+
+        namespace_name = f"tenant-{subdomain}"
+
+        namespace = client.V1Namespace(
+            api_version="v1",
+            kind="Namespace",
+            metadata=client.V1ObjectMeta(
+                name=namespace_name,
+                labels={
+                    "tenant-id": tenant_id,
+                    "subdomain": subdomain,
+                    "managed-by": "kairos-control-plane",
+                },
+            ),
+        )
+
+        try:
+            await self._run_in_executor(
+                self.core_v1.create_namespace,
+                body=namespace,
+            )
+            logger.info(f"Created tenant namespace: {namespace_name}")
+            return {"success": True, "namespace": namespace_name}
+        except ApiException as e:
+            if e.status == 409:  # Already exists
+                logger.info(f"Namespace {namespace_name} already exists")
+                return {"success": True, "namespace": namespace_name, "already_existed": True}
+            error_body = e.body if hasattr(e, "body") else "No response body"
+            logger.error(
+                f"Failed to create namespace '{namespace_name}': "
+                f"Status={e.status}, Reason={e.reason}, Body={error_body}"
+            )
+            return {
+                "success": False,
+                "error": f"Kubernetes API error: {e.reason}",
+                "status_code": e.status,
+            }
+
+    async def create_tenant_configmap(
+        self,
+        tenant_id: str,
+        subdomain: str,
+        organization: str,
+        admin_email: str,
+        base_domain: str,
+    ) -> dict:
+        """
+        Create a ConfigMap with tenant configuration.
+
+        Args:
+            tenant_id: Unique tenant identifier
+            subdomain: Tenant subdomain
+            organization: Organization name
+            admin_email: Admin email address
+            base_domain: Base domain for sites
+
+        Returns:
+            dict with success status
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to Kubernetes"}
+
+        configmap_name = f"tenant-{tenant_id[:8]}-config"
+        site_name = f"{subdomain}.{base_domain}"
+
+        configmap = client.V1ConfigMap(
+            api_version="v1",
+            kind="ConfigMap",
+            metadata=client.V1ObjectMeta(
+                name=configmap_name,
+                namespace=self.namespace,
+                labels={
+                    "tenant-id": tenant_id,
+                    "subdomain": subdomain,
+                },
+            ),
+            data={
+                "tenant-id": tenant_id,
+                "subdomain": subdomain,
+                "organization": organization,
+                "admin-email": admin_email,
+                "site-name": site_name,
+                "site-url": f"https://{site_name}",
+            },
+        )
+
+        try:
+            await self._run_in_executor(
+                self.core_v1.create_namespaced_config_map,
+                namespace=self.namespace,
+                body=configmap,
+            )
+            logger.info(f"Created tenant configmap: {configmap_name}")
+            return {"success": True, "configmap_name": configmap_name}
+        except ApiException as e:
+            error_body = e.body if hasattr(e, "body") else "No response body"
+            logger.error(
+                f"Failed to create configmap '{configmap_name}': "
+                f"Status={e.status}, Reason={e.reason}, Body={error_body}"
+            )
+            return {
+                "success": False,
+                "error": f"Kubernetes API error: {e.reason}",
+                "status_code": e.status,
+            }
+
+    async def delete_tenant_namespace(self, subdomain: str) -> dict:
+        """
+        Delete a tenant's namespace and all resources within it.
+
+        Args:
+            subdomain: Tenant subdomain
+
+        Returns:
+            dict with success status
+        """
+        if not self._connected:
+            return {"success": False, "error": "Not connected to Kubernetes"}
+
+        namespace_name = f"tenant-{subdomain}"
+
+        try:
+            await self._run_in_executor(
+                self.core_v1.delete_namespace,
+                name=namespace_name,
+                body=client.V1DeleteOptions(propagation_policy="Foreground"),
+            )
+            logger.info(f"Deleted tenant namespace: {namespace_name}")
+            return {"success": True}
+        except ApiException as e:
+            if e.status == 404:
+                logger.info(f"Namespace {namespace_name} not found, skipping deletion")
+                return {"success": True, "not_found": True}
+            error_body = e.body if hasattr(e, "body") else "No response body"
+            logger.error(
+                f"Failed to delete namespace '{namespace_name}': "
+                f"Status={e.status}, Reason={e.reason}, Body={error_body}"
+            )
+            return {
+                "success": False,
+                "error": f"Kubernetes API error: {e.reason}",
+            }
+
     async def delete_tenant_resources(self, tenant_id: str, subdomain: str) -> dict:
         """
         Delete all Kubernetes resources for a tenant.
@@ -541,6 +697,26 @@ class GKEService:
                     f"Failed to delete job: {e.reason} (Status: {e.status}, Body: {error_body})"
                 )
 
+        # Delete configmap
+        try:
+            configmap_name = f"tenant-{tenant_id[:8]}-config"
+            await self._run_in_executor(
+                self.core_v1.delete_namespaced_config_map,
+                name=configmap_name,
+                namespace=self.namespace,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                error_body = e.body if hasattr(e, "body") else "No response body"
+                errors.append(
+                    f"Failed to delete configmap: {e.reason} (Status: {e.status}, Body: {error_body})"
+                )
+
+        # Delete tenant namespace (this also deletes all resources in it)
+        namespace_result = await self.delete_tenant_namespace(subdomain)
+        if not namespace_result["success"] and not namespace_result.get("not_found"):
+            errors.append(f"Failed to delete namespace: {namespace_result.get('error')}")
+
         if errors:
-            return {"success": False, "errors": errors}
+            return {"success": False, "errors": errors, "resources_remaining": errors}
         return {"success": True}
