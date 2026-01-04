@@ -2,7 +2,7 @@
 Demo Service for managing trial users in the demo tenant.
 
 This service handles trial signups by creating users in the shared demo tenant
-(demo.kairos.app) instead of provisioning new tenants.
+(demo.1kairos.com) instead of provisioning new tenants.
 
 TODO: Replace mock implementation with actual Frappe API calls to demo tenant.
 """
@@ -16,7 +16,7 @@ from ..models import TrialSignupRequest, TrialSignupResponse
 logger = logging.getLogger(__name__)
 
 # Demo tenant configuration
-DEMO_TENANT_URL = "https://demo.kairos.app"
+DEMO_TENANT_URL = "https://demo.1kairos.com"
 DEMO_TENANT_API_URL = f"{DEMO_TENANT_URL}/api"
 
 

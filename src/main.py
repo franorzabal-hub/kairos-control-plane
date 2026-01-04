@@ -51,10 +51,10 @@ from .models import (
 from .services import GKEService, TenantService, DemoService, PendingSignupsService, EmailService
 
 # Demo tenant configuration
-DEMO_TENANT_URL = os.environ.get("DEMO_TENANT_URL", "https://demo.kairos.app")
+DEMO_TENANT_URL = os.environ.get("DEMO_TENANT_URL", "https://demo.1kairos.com")
 
 # Landing page URL for redirects
-LANDING_PAGE_URL = os.environ.get("LANDING_PAGE_URL", "https://kairos.app")
+LANDING_PAGE_URL = os.environ.get("LANDING_PAGE_URL", "https://1kairos.com")
 
 
 # Structured JSON logging
@@ -107,9 +107,9 @@ ENVIRONMENT = os.environ.get("ENVIRONMENT", "production")
 
 # CORS configuration
 DEFAULT_ALLOWED_ORIGINS = [
-    "https://kairos.app",
-    "https://admin.kairos.app",
-    "https://landing.kairos.app",
+    "https://1kairos.com",
+    "https://admin.1kairos.com",
+    "https://landing.1kairos.com",
 ]
 
 # Add localhost for development
@@ -121,7 +121,7 @@ if ENVIRONMENT == "development":
     ])
 
 CONFIG = {
-    "base_domain": os.environ.get("BASE_DOMAIN", "kairos.app"),
+    "base_domain": os.environ.get("BASE_DOMAIN", "1kairos.com"),
     "gke_namespace": os.environ.get("GKE_NAMESPACE", "frappe"),
     "frappe_image": os.environ.get("FRAPPE_IMAGE", "frappe/frappe-worker:v15"),
     "use_in_cluster": os.environ.get("USE_IN_CLUSTER", "true").lower() == "true",
@@ -439,7 +439,7 @@ async def trial_signup(request: Request, data: TrialSignupRequest):
     """
     Sign up for a trial account in the demo tenant.
 
-    This endpoint creates a new user in the shared demo tenant (demo.kairos.app)
+    This endpoint creates a new user in the shared demo tenant (demo.1kairos.com)
     instead of provisioning a new tenant. All trial users share the same demo
     environment.
 

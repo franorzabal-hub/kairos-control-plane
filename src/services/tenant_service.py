@@ -68,7 +68,7 @@ class TenantService:
     _subdomain_locks: dict[str, asyncio.Lock] = {}
     _global_lock: asyncio.Lock = asyncio.Lock()
 
-    def __init__(self, gke_service: GKEService, base_domain: str = "kairos.app"):
+    def __init__(self, gke_service: GKEService, base_domain: str = "1kairos.com"):
         """
         Initialize the tenant service.
 
