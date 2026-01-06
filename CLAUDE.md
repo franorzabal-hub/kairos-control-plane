@@ -11,6 +11,51 @@ API para gestión de tenants (colegios). Orquesta la creación/eliminación de i
 - **Cloud**: Google Cloud (GKE, Cloud Run, Firestore, Secret Manager)
 - **Deploy**: Cloud Run
 
+---
+
+## Desarrollo y Deploy
+
+> **Documentación completa**: Ver [infra/docs/DEVELOPMENT.md](https://github.com/franorzabal-hub/frappe-saas-platform/blob/main/docs/DEVELOPMENT.md)
+
+### Ambientes
+
+| Ambiente | URL | Trigger |
+|----------|-----|---------|
+| **Dev** | `api-dev.1kairos.com` | Push a `main` |
+| **Prod** | `api.1kairos.com` | Tag `v*` |
+
+### Desarrollo (sin Docker local)
+
+```bash
+# Configurar ambiente
+cat > .env << 'EOF'
+FRAPPE_URL=https://dev.1kairos.com
+ENVIRONMENT=development
+GCP_PROJECT=kairos-escuela-app
+EOF
+
+# Desarrollar
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+uvicorn src.main:app --reload --port 8001
+# → http://localhost:8001 (conecta a dev.1kairos.com)
+```
+
+### Deploy
+
+```bash
+# Deploy a Dev (automático)
+git add . && git commit -m "feat: ..." && git push
+# → Automático a api-dev.1kairos.com
+
+# Deploy a Prod
+git tag v1.0.0 -m "Release 1.0.0"
+git push origin v1.0.0
+# → Automático a api.1kairos.com
+```
+
+---
+
 ## Funcionalidades
 
 - Crear nuevos tenants (colegios)
@@ -64,42 +109,15 @@ PUT    /api/tenants/{id}/subdomain # Cambiar subdomain
 POST /webhooks/job-status         # Callback de K8s jobs
 ```
 
-## Desarrollo
-
-```bash
-# Setup
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Run
-uvicorn src.main:app --reload --port 8080
-
-# Con Docker
-docker build -t control-plane .
-docker run -p 8080:8080 control-plane
-```
-
 ## Variables de Entorno
 
-```bash
-# Core
-ENVIRONMENT=development
-PORT=8080
-BASE_DOMAIN=1kairos.com
-API_KEY=your-api-key
-
-# GKE
-GKE_PROJECT=kairos-escuela-app
-GKE_LOCATION=us-central1
-GKE_CLUSTER=kairos-cluster-dev
-GKE_NAMESPACE=frappe
-
-# Opcionales
-FIRESTORE_ENABLED=false
-SECRET_MANAGER_ENABLED=false
-WEBHOOK_SECRET=hmac-secret
-```
+| Variable | Dev | Prod |
+|----------|-----|------|
+| `ENVIRONMENT` | `development` | `production` |
+| `FRAPPE_URL` | `https://dev.1kairos.com` | (dinámico) |
+| `GCP_PROJECT` | `kairos-escuela-app` | `kairos-escuela-app` |
+| `GKE_CLUSTER` | `kairos-cluster-dev` | `kairos-cluster-prod` |
+| `BASE_DOMAIN` | `1kairos.com` | `1kairos.com` |
 
 ## Flujo de Provisioning
 
